@@ -32,6 +32,10 @@ overwrite and compares them afterwards.
   saved state. I read its README and not its code, so I cannot say whether it covers pool,
   instance or extension settings. [restapi](https://github.com/Bolton-and-Menk-GIS/restapi)
   is a Python library for the REST API, and it can be a base for tools like this one.
+- **ArcGIS API for Python and WebGIS DR.** The `arcgis.gis.server` module of Esri's ArcGIS API
+  for Python can read and edit services, and Esri's WebGIS DR tool backs up and restores a whole
+  portal deployment. Neither is a restore tool for four settings groups of one service. I did not
+  exercise either one for this tool and have no documentation excerpt to quote for them.
 
 On 2026-10-13 I searched GitHub for the name `svcparity` and for ArcGIS Server admin, backup and
 restore terms. I found no repository of that name. The closest ones are listed above.
@@ -214,8 +218,9 @@ that links the two, so you name each item with `--item`.
   self-test pins that `--ap` and `--appl` exit 64 and write nothing.
 - **`--apply` needs `--backup`.** The tool writes the pre-restore state to a file that must not
   exist, before its first write. It makes no file when no service needs a change.
-- **A failed restore puts the service back.** After each restore the tool waits for the service
-  to report its earlier state. Then it reads the service again and compares. A rejected edit, a
+- **A failed restore puts the service back.** After each restore the tool waits until the service
+  reports its earlier state on two status reads in a row. One read is not enough, because the
+  first read after a write can be stale. Then the tool reads the service again and compares. A rejected edit, a
   service that does not return, or a setting that does not read back sends the service to its
   pre-restore state. If that also fails, the output says "NOT put back" and the exit code is 2.
 - **It will not turn edit capabilities on by surprise.** A restore can switch on Create, Update,
@@ -227,10 +232,15 @@ that links the two, so you name each item with `--item`.
   Change those services in Manager.
 - **Plain `http://` is accepted for `127.0.0.1` and `localhost` only.** Any other server needs `https://`. There
   is no flag to turn certificate checks off.
+- **A bad URL is a usage error.** The tool trims whitespace around `--server` and `--portal`. It
+  refuses a space or control character inside, a malformed host or port, and a user name or
+  password in the URL, with exit 64. Service names and item ids must match exactly, with no
+  trailing newline.
 - **The token moves the way Esri says.** A GET carries the token in the query. A POST carries it
   in the body, as the Administrator API pages require. The password goes in a POST body only.
 - **Every credential is masked in the output.** The tool replaces any token or password it has
-  seen with `***`. That includes one that a server echoes back in an error message.
+  seen with `***`. That includes one that a server echoes back in an error message, and the
+  traceback that the tool prints on exit 70.
 
 ## Why the obvious version is wrong
 
@@ -267,7 +277,7 @@ Every row ran against the local stub, through `main()`, with the output checked.
 | A snapshot that compares nothing exits 4 | `compares nothing and exits 4` |
 | Edit capabilities need `--allow-edit-capabilities` | The two `edit capabilities` assertions |
 | A rejected edit, a refused provider, a missing read-back and a service that never returns all end in a revert or a clear failure | The `attempt` assertions |
-| No credential reaches any output | The last assertion greps everything every run printed or wrote |
+| No credential reaches any output | The last assertion greps everything every run printed, and the one backup file it read |
 | A real subprocess run, with the stub on loopback, matches the sample output above | I ran `--snapshot`, `--diff`, `--restore` and `--restore --apply --backup` as separate processes and kept the output |
 
 ## Limits

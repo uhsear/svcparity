@@ -44,6 +44,7 @@ import re
 import sys
 import time
 import traceback
+from http.client import HTTPException
 from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -93,6 +94,7 @@ PROVIDERS = ("ArcObjects11", "DMaps")
 HTTP_TIMEOUT = 60       # seconds for one request
 TOKEN_MINUTES = 15      # lifetime asked for when a token is minted here
 START_WAIT = 120        # seconds to wait for a service to return to its state
+SETTLE_READS = 2        # consecutive status reads that must show that state
 POLL_SECONDS = 2        # pause between status reads
 
 # =============================================================================
@@ -100,8 +102,9 @@ POLL_SECONDS = 2        # pause between status reads
 # =============================================================================
 
 FORMAT = "svcparity/1"
-SERVICE_RE = re.compile(r"^[A-Za-z0-9_\-]+(/[A-Za-z0-9_\-]+)*\.[A-Za-z]+$")
-ITEM_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# \Z, not $: $ also matches before a trailing newline.
+SERVICE_RE = re.compile(r"^[A-Za-z0-9_\-]+(/[A-Za-z0-9_\-]+)*\.[A-Za-z]+\Z")
+ITEM_RE = re.compile(r"^[0-9a-fA-F]{32}\Z")
 LOOPBACK = ("127.0.0.1", "localhost")
 
 EXIT_OK, EXIT_DIFF, EXIT_FAILED, EXIT_READ, EXIT_NONE, EXIT_REFUSED = range(6)
@@ -396,9 +399,22 @@ def load_state(path):
 # ------------------------------------------------------------------- network
 
 def check_url(url):
-    """Plain http is accepted for loopback only, so a credential never crosses
-    a network in clear text."""
-    parts = urlsplit(url)
+    """Plain http is accepted for loopback only, so the first request never
+    crosses a network in clear text. Surrounding whitespace is dropped, because
+    a file read in PowerShell keeps its newline. Any other whitespace or control
+    character, and any user name or password in the URL, is refused before the
+    URL can reach a request or a message."""
+    url = url.strip()
+    if re.search(r"[\s\x00-\x1f\x7f]", url):
+        raise UsageError("the URL contains a space or a control character")
+    try:
+        parts = urlsplit(url)
+        parts.port      # raises ValueError for a port that is not a number
+    except ValueError:
+        raise UsageError("the URL is malformed")
+    if "@" in parts.netloc:
+        raise UsageError("the URL must not carry a user name or password; "
+                         "credentials come from the environment")
     loopback = parts.hostname in LOOPBACK
     if not parts.hostname or parts.scheme not in ("http", "https") \
             or (parts.scheme == "http" and not loopback):
@@ -436,6 +452,11 @@ def http_json(method, url, fields):
             doc = json.loads(r.read().decode("utf-8"))
     except OSError as exc:
         raise ServiceError("%s %s failed: %s" % (method, url, exc))
+    except HTTPException as exc:
+        # A reply cut off in the middle, or not HTTP at all. Only the class
+        # name is shown: the text of InvalidURL carries the whole request path.
+        raise ServiceError("%s %s failed: the reply was cut off or is not HTTP "
+                           "(%s)" % (method, url, type(exc).__name__))
     except ValueError:
         raise ServiceError("%s %s did not return JSON" % (method, url))
     if not isinstance(doc, dict):
@@ -530,11 +551,18 @@ def connect(args):
 
 
 def wait_state(client, svc, target):
-    """Wait until the service reports the state it had before the write."""
+    """Wait until the service reports the state it had before the write, on
+    SETTLE_READS reads in a row. One read is not enough: the first read after a
+    write can still show the state from before the restart began.
+
+    shortcut: a stale read that lasts longer than one poll still passes. Esri
+    gives no timing for the status change, so there is no better signal."""
     end = TIMER.now() + START_WAIT
+    streak = 0
     while True:
         seen = client.status(svc).get("realTimeState")
-        if seen == target:
+        streak = streak + 1 if seen == target else 0
+        if streak >= SETTLE_READS:
             return
         if TIMER.now() >= end:
             raise ServiceError("%s: still %s after %d seconds, wanted %s"
@@ -816,7 +844,7 @@ def main(argv=None):
     except Exception as exc:
         say("svcparity: unexpected %s: %s. This is a fault in the tool, not a "
             "finding about the service." % (type(exc).__name__, exc), err=True)
-        traceback.print_exc()
+        say(traceback.format_exc().rstrip(), err=True)   # masked like the rest
         return EXIT_INTERNAL
 
 
@@ -849,7 +877,9 @@ def fixture_service(name, found=True, extras="path"):
         "isolationLevel": "HIGH",
         "properties": {
             "maxRecordCount": "4000" if tuned else "1000",
-            "maxBufferCount": "100",
+            "maxBufferCount": "100", "maxImageHeight": "4096",
+            "maxImageWidth": "4096", "maxDomainCodeCount": "25000",
+            "antialiasingMode": "Fast", "textAntialiasingMode": "Force",
             "filePath": "/srv/defs/%s_v1.msd" % name if tuned
             else "/srv/defs/%s_v2.msd" % name,
             "schemaLockingEnabled": "false" if tuned else "true",
@@ -898,7 +928,7 @@ def make_stub():
 
         def __init__(self):
             self.services, self.running, self.items = {}, {}, {}
-            self.fault, self.log = {}, []
+            self.fault, self.log, self.mint = {}, [], {}
 
     stub = Stub()
 
@@ -909,11 +939,12 @@ def make_stub():
         def log_message(self, *_args):
             pass
 
-        def reply(self, doc, raw=None, code=200):
+        def reply(self, doc, raw=None, code=200, cut=False):
             data = raw if raw is not None else json.dumps(doc).encode("ascii")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            # cut: promise 100 more bytes than are sent, then hang up
+            self.send_header("Content-Length", str(len(data) + (100 if cut else 0)))
             self.end_headers()
             self.wfile.write(data)
 
@@ -930,6 +961,7 @@ def make_stub():
                              "token" in body, sorted(body)))
             path = parts.path
             if path == "/arcgis/admin/generateToken":
+                stub.mint = body
                 if (body.get("username"), body.get("password")) == (
                         stub.user, stub.password):
                     return self.reply({"token": stub.token, "expires": 1})
@@ -954,13 +986,21 @@ def make_stub():
             if svc not in stub.services:
                 return self.reply(error("Service %s does not exist" % svc, 404))
             if op == "status":
-                real = "STARTED" if stub.running.get(svc, True) else "STOPPED"
-                if fault.get("delay", 0) > 0:
-                    fault["delay"] -= 1
-                    real = "STOPPED"
+                conf = "STARTED" if stub.running.get(svc, True) else "STOPPED"
+                real = conf
                 if fault.get("never_started"):
                     real = "STOPPED"
-                conf = "STARTED" if stub.running.get(svc, True) else "STOPPED"
+                if fault.get("_down", 0) > 0:
+                    # restarting after a write: STOPPED for restart_polls reads
+                    fault["_down"] -= 1
+                    real = "STOPPED"
+                if fault.get("_stale") is not None:
+                    # dies_after_edit: one read still shows the old state, then
+                    # the service never comes back
+                    if fault["_stale"] > 0:
+                        fault["_stale"] -= 1
+                    else:
+                        real = "STOPPED"
                 return self.reply({"configuredState": conf,
                                    "realTimeState": real})
             if op == "edit":
@@ -973,14 +1013,29 @@ def make_stub():
                 for key in fault.get("ignore", []):
                     new["properties"][key] = old["properties"][key]
                 stub.services[svc] = new
+                if fault.get("restart_polls"):
+                    fault["_down"] = fault["restart_polls"]
+                if fault.get("dies_after_edit"):
+                    fault["_stale"] = 1
+                if fault.get("cut_edit"):
+                    # the edit is applied, the reply is cut off in the middle
+                    fault["cut_edit"] -= 1
+                    return self.reply(None, raw=b'{"status": "success"}',
+                                      cut=True)
                 return self.reply({"status": "success"})
             if op == "changeProvider":
                 if fault.get("provider") == "error" \
                         or body.get("provider") not in PROVIDERS:
                     return self.reply(error("cannot change provider"))
                 stub.services[svc]["provider"] = body["provider"]
+                if fault.get("restart_polls"):
+                    fault["_down"] = fault["restart_polls"]
                 return self.reply({"status": "success"})
             kind = fault.get("get")
+            if kind == "echo":
+                return self.reply(error("rejected, token %s" % sent["token"]))
+            if kind == "cut":
+                return self.reply(None, raw=b'{"serviceName": "x"}', cut=True)
             if kind == "http500":
                 return self.reply(None, raw=b"boom", code=500)
             if kind == "text":
@@ -999,8 +1054,9 @@ def make_stub():
 
         def portal(self, tail, sent):
             if sent.get("token") != stub.ptoken:
-                return self.reply({"error": {"code": 498,
-                                             "message": "Invalid token"}})
+                return self.reply({"error": {
+                    "code": 498,
+                    "message": "Invalid token %s" % sent.get("token")}})
             item_id = tail[0] if tail[1] == "groups" else tail[1]
             item = stub.items.get(item_id)
             if item is None:
@@ -1144,6 +1200,28 @@ def _self_test(stub, tmp, clock):
           and "description" not in state and "clusterName" not in state["pool"],
           "the state holds the allowlisted keys and not the service "
           "definition path  <-- pinned defect")
+    pool_names = ["isolationLevel", "loadBalancing", "maxIdleTime",
+                  "maxInstancesPerNode", "maxStartupTime", "maxUsageTime",
+                  "maxWaitTime", "minInstancesPerNode", "recycleInterval"]
+    prop_names = ["antialiasingMode", "maxBufferCount", "maxDomainCodeCount",
+                  "maxImageHeight", "maxImageWidth", "maxRecordCount",
+                  "schemaLockingEnabled", "textAntialiasingMode"]
+    check(sorted(state["pool"]) == pool_names
+          and sorted(state["properties"]) == prop_names,
+          "every pool and service property key that the README lists is saved")
+    each_key = []
+    for group, names in (("pool", pool_names), ("properties", prop_names)):
+        for name in names:
+            probe = {"serviceName": "X", "properties": {}, "extensions": []}
+            (probe if group == "pool" else probe["properties"])[name] = "old"
+            moves = plan({group: {name: "new"}}, probe)
+            body = apply_changes(probe, moves)
+            got = body[name] if group == "pool" else body["properties"][name]
+            each_key.append(len(moves) == 1 and moves[0].live == "old"
+                            and got == "new")
+    check(len(each_key) == 17 and all(each_key),
+          "each of the 17 pool and property keys is read from the live service, "
+          "diffed and written into the edit body")
     check(secret_withheld == ["ext.FeatureServer.properties.outputDir",
                               "ext.FeatureServer.properties.dbPassword"]
           and withheld == ["ext.FeatureServer.properties.outputDir"]
@@ -1261,6 +1339,10 @@ def _self_test(stub, tmp, clock):
          dict(good_doc, items={"abc": {"access": "org", "groups": []}})),
         ("an item of the wrong shape",
          dict(good_doc, items={ITEM1: {"access": "org", "groups": [1]}})),
+        ("a service name with a trailing newline",
+         dict(good_doc, services={SVC1 + "\n": state})),
+        ("an item id with a trailing newline",
+         dict(good_doc, items={ITEM1 + "\n": {"access": "org", "groups": []}})),
         ("a list", []),
     ]
     for label, doc in bad_docs:
@@ -1277,11 +1359,22 @@ def _self_test(stub, tmp, clock):
           and check_url("http://localhost/arcgis"),
           "https is accepted anywhere, plain http only on loopback, and a "
           "trailing slash is dropped")
+    check(check_url(" https://h.example/arcgis\r\n") == "https://h.example/arcgis",
+          "whitespace around a URL, such as the newline of a file read in "
+          "PowerShell, is dropped")
     for url in ("http://gis.example.com/arcgis", "gis.example.com", "ftp://x/y",
                 "https://"):
         raises(lambda url=url: check_url(url), UsageError,
-               "%s is refused, so a credential never leaves in clear text"
+               "%s is refused, so the first request is never sent in clear text"
                % url)
+    for label, url in (("a space inside", "https://gis.example.com/arc gis"),
+                       ("a control character", "https://gis.example.com/a\x07b"),
+                       ("an unclosed IPv6 host", "http://[::1"),
+                       ("a port that is not a number", "https://h.example:abc"),
+                       ("a user name and password", "https://u:pw-in-url-3@h.example/arcgis")):
+        raises(lambda url=url: check_url(url), UsageError,
+               "a URL with %s is a usage error, not a fault in the tool  "
+               "<-- pinned defect" % label)
     with env_patch("https_proxy", https_proxy="http://proxy.invalid:3128"):
         loop_proxies = [h.proxies for h in opener_for("http://127.0.0.1:1/")
                         .handlers if isinstance(h, ProxyHandler)]
@@ -1335,6 +1428,46 @@ def _self_test(stub, tmp, clock):
                           "--service", SVC1], SVCPARITY_TOKEN="t")
     check(code == 64 and "https://" in err,
           "plain http to a remote server is refused with the reason")
+    code, out, err = cli(["--snapshot", "--server",
+                          "https://u:pw-in-url-3@h.example/arcgis",
+                          "--service", SVC1], SVCPARITY_TOKEN="t")
+    check(code == 64 and "pw-in-url-3" not in out + err,
+          "a password in the --server URL is refused and never printed")
+    code, out, err = cli(["--snapshot", "--server", stub.url + "/arc gis",
+                          "--service", SVC1], **tok)
+    check(code == 64 and stub.token not in out + err and "Traceback" not in err,
+          "a space inside --server is a usage error, and the token does not "
+          "reach the output  <-- pinned defect")
+    code, out, err = cli(["--snapshot", "--server", stub.url + "/arcgis\r\n",
+                          "--service", SVC1], **tok)
+    check(code == 0 and "Traceback" not in err,
+          "a --server value that ends in a newline is trimmed and works  "
+          "<-- pinned defect")
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1 + "\n"], **tok)
+    check(code == 64 and "not Folder/Name.Type" in err,
+          "a --service name that ends in a newline is refused  <-- pinned defect")
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1] + por
+                         + ["--item", ITEM1 + "\n"], **tok)
+    check(code == 64 and "32 character" in err,
+          "an item id that ends in a newline is refused  <-- pinned defect")
+    keep_run = run
+    globals()["run"] = lambda args: (_ for _ in ()).throw(
+        RuntimeError("fault carrying leak-probe-secret-8"))
+    try:
+        SECRETS[:] = ["leak-probe-secret-8"]
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            code = main(["--diff", "--state", "x", "--server", "https://h"])
+        seen.append(err_buf.getvalue())
+        del SECRETS[:]
+    finally:
+        globals()["run"] = keep_run
+    check(code == 70 and "RuntimeError" in err_buf.getvalue()
+          and "Traceback" in err_buf.getvalue()
+          and "leak-probe-secret-8" not in err_buf.getvalue(),
+          "the traceback printed on exit 70 is masked like every other line  "
+          "<-- pinned defect")
+    stub.log[:] = []
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1])
     check(code == 64 and "SVCPARITY_TOKEN" in err and not stub.log,
           "no credential in the environment is a usage error before any "
@@ -1379,6 +1512,12 @@ def _self_test(stub, tmp, clock):
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1], **tok)
     check(code == 3 and "not return a JSON object" in err,
           "a JSON reply that is not an object exits 3")
+    stub.fault["get"] = "cut"
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1], **tok)
+    check(code == 3 and "cut off" in err and "IncompleteRead" in err
+          and "Traceback" not in err,
+          "a reply cut off in the middle exits 3, not the 70 of a fault in "
+          "the tool  <-- pinned defect")
     stub.fault["get"] = "bare"
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1], **tok)
     check(code == 3 and "Oops; first; second" in err,
@@ -1407,7 +1546,7 @@ def _self_test(stub, tmp, clock):
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1] + por +
                          ["--item", ITEM1], SVCPARITY_TOKEN=stub.token,
                          SVCPARITY_PORTAL_TOKEN="bad-portal-token-5")
-    check(code == 3 and "Invalid token" in err and "bad-portal" not in err,
+    check(code == 3 and "Invalid token ***" in err and "bad-portal" not in err,
           "a portal token the portal rejects exits 3 and is not printed")
     raises(lambda: http_json("POST", stub.url + "/arcgis/admin/services/"
                              + SVC1 + "/edit", {"f": "json"}), ServiceError,
@@ -1442,6 +1581,18 @@ def _self_test(stub, tmp, clock):
           and "token" not in mint[0][4],
           "a token is minted from a user and password, which travel in a POST "
           "body and never in a URL")
+    check(stub.mint.get("client") == "requestip"
+          and stub.mint.get("expiration") == "15" and stub.mint.get("f") == "json",
+          "the token request asks for client=requestip and 15 minutes, as in "
+          "Esri's Generate Token reference")
+    stub.fault["get"] = "echo"
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
+                         SVCPARITY_USER=stub.user, SVCPARITY_PASSWORD=stub.password,
+                         SVCPARITY_PORTAL_TOKEN=stub.ptoken)
+    stub.fault.clear()
+    check(code == 3 and "rejected, token ***" in err and stub.token not in err,
+          "a minted token that the server echoes back is masked, even when "
+          "the portal token is a different one  <-- pinned defect")
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
                          SVCPARITY_USER=stub.user, SVCPARITY_PASSWORD="wrong-pw-77")
     check(code == 3 and "Invalid username or password" in err
@@ -1519,6 +1670,15 @@ def _self_test(stub, tmp, clock):
     check(code == 1 and "Plan only. Nothing was written" in out
           and not posts() and stub.services == before_plan,
           "--restore without --apply plans, prints it, and writes nothing")
+    for short in ("--ap", "--appl"):
+        code, out, err = cli(["--restore", "--state", snap_path, short,
+                              "--backup", tmpfile("abbrev.json")] + srv + por,
+                             **tok)
+        check(code == 64 and not posts() and stub.services == before_plan
+              and not os.path.exists(tmpfile("abbrev.json")),
+              "%s with a valid --state and --backup is refused and the service "
+              "is unchanged: only the full flag writes  <-- pinned defect"
+              % short)
 
     # ---- restore: refusals before any write
     exists = tmpfile("exists.json")
@@ -1603,6 +1763,17 @@ def _self_test(stub, tmp, clock):
                           "--backup", gone_backup] + srv + por, **tok)
     check(code == 0 and not posts() and not os.path.exists(gone_backup),
           "a second run finds nothing to do, writes nothing and creates no backup")
+    overwrite(SVC1)
+    stub.items[ITEM1]["access"] = "public"
+    code, out, err = cli(["--restore", "--state", snap_path, "--apply",
+                          "--backup", tmpfile("undo-share.json")] + srv + por,
+                         **tok)
+    stub.items[ITEM1]["access"] = "org"
+    check(code == 1 and "VERDICT: DIFFERS" in out
+          and "access is public, saved org" in out
+          and stub.services[SVC1]["maxInstancesPerNode"] == 6,
+          "a restore that fixes the service but leaves a sharing difference "
+          "exits 1, not a clean 0  <-- pinned defect")
 
     # ---- restore: the undo path
     def one_service_state():
@@ -1637,13 +1808,36 @@ def _self_test(stub, tmp, clock):
     check("revert failed" in err and "NOT put back: use the backup file" in err,
           "a revert that also fails says so and points at the backup file")
 
+    err = attempt("a service that dies after the edit", {"dies_after_edit": True},
+                  "still STOPPED after 120 seconds", put_back=False)
+    check("NOT put back" in err,
+          "a first status read that is stale after the edit does not count as "
+          "the service having come back  <-- pinned defect")
+    err = attempt("a reply to the edit that is cut off", {"cut_edit": 1},
+                  "cut off")
+    check("IncompleteRead" in err and "Traceback" not in err,
+          "a cut reply in the middle of --apply reverts the service and exits "
+          "2, not 70  <-- pinned defect")
+
     overwrite(SVC1)
-    stub.fault["delay"] = 3
+    stub.fault["restart_polls"] = 3
     clock[0] = 1000.0
+    stub.log[:] = []
     code, out, err = cli(["--restore", "--state", one_service_state(), "--apply",
                           "--backup", tmpfile("undo-slow.json")] + srv, **tok)
-    check(code == 0 and clock[0] >= 1000.0 + 2 * POLL_SECONDS,
-          "a service that takes a few polls to come back is waited for")
+    calls = []
+    for entry in stub.log:
+        last = entry[1].rsplit("/", 1)[1]
+        calls.append(last if last in ("status", "edit", "changeProvider")
+                     else "get")
+    # 3 STOPPED reads, then SETTLE_READS good ones, after each of the two writes
+    check(code == 0 and " ".join(calls) == " ".join(
+        ["get", "status", "get", "changeProvider"] + ["status"] * 5
+        + ["get", "edit"] + ["status"] * 5 + ["get"])
+          and clock[0] == 1000.0 + 2 * 4 * POLL_SECONDS,
+          "after changeProvider and again after the edit, the tool polls "
+          "status until the service has been back on two reads in a row  "
+          "<-- pinned defect")
     stub.fault.clear()
 
     overwrite(SVC1)
@@ -1761,7 +1955,8 @@ def _self_test(stub, tmp, clock):
     blob = "\n".join(seen)
     check(not any(s in blob for s in (stub.token, stub.ptoken, stub.password,
                                       "synthetic-db-pass", "wrong-pw-77",
-                                      "expired-token-1")),
+                                      "expired-token-1", "pw-in-url-3",
+                                      "leak-probe-secret-8")),
           "no token, password or extension credential appears in anything any "
           "run above printed or wrote")
 
