@@ -32,13 +32,18 @@ overwrite and compares them afterwards.
   saved state. I read its README and not its code, so I cannot say whether it covers pool,
   instance or extension settings. [restapi](https://github.com/Bolton-and-Menk-GIS/restapi)
   is a Python library for the REST API, and it can be a base for tools like this one.
-- **ArcGIS API for Python and WebGIS DR.** The `arcgis.gis.server` module of Esri's ArcGIS API
-  for Python can read and edit services, and Esri's WebGIS DR tool backs up and restores a whole
-  portal deployment. Neither is a restore tool for four settings groups of one service. I did not
-  exercise either one for this tool and have no documentation excerpt to quote for them.
+- **ArcGIS API for Python.** The
+  [`arcgis.gis.server`](https://developers.arcgis.com/python/latest/api-reference/arcgis.gis.server.html)
+  module has a service `edit` method and a `change_provider` method. Its `edit` text repeats the
+  REST page: "you need to submit the complete JSON representation of the service". It gives you
+  the calls. I found no snapshot or diff method on that reference page, so you write that part
+  yourself. I did not run the module for this tool.
+- **WebGIS DR.** Esri also ships a WebGIS DR tool. I did not read its documentation, so I make no
+  claim about what it covers.
 
-On 2026-10-13 I searched GitHub for the name `svcparity` and for ArcGIS Server admin, backup and
-restore terms. I found no repository of that name. The closest ones are listed above.
+On 2026-10-15 I searched GitHub for the name `svcparity` and for ArcGIS Server service settings
+and restore terms. The only repository named `svcparity` is this one. I found no other tool that
+restores these settings. I may have missed one.
 
 ```
 $ python svcparity.py --self-test
@@ -52,9 +57,15 @@ PASS  the edit body keeps every key the plan did not name, because the server dr
 ...
 PASS  restoring a service to LESS edit access needs no permission  <-- pinned defect
 ...
+PASS  a snapshot saved with a UTF-8 byte order mark loads  <-- pinned defect
+...
 PASS  a unique prefix --ap of --apply is REFUSED by the parser and writes nothing  <-- pinned defect
 ...
+PASS  a service whose JSON has no provider key is snapshotted with a warning on stderr, not silently  <-- pinned defect
+...
 PASS  a 200 with an error body is an error, which a status check misses  <-- pinned defect
+...
+PASS  a redirect is an error and is not followed, so the token never reaches the host that the Location header names  <-- pinned defect
 ...
 PASS  a rejected login exits 3 and the password the server echoed back is masked  <-- pinned defect
 ...
@@ -68,7 +79,7 @@ PASS  a service whose JSON carries a credential-like key is never edited, becaus
 ...
 PASS  no token, password or extension credential appears in anything any run above printed or wrote
 --------------------------------------------------------------------
-125 assertions, 0 failed
+214 assertions, 0 failed
 ```
 
 ## Requirements
@@ -92,6 +103,10 @@ python svcparity.py --snapshot --server https://gis.example.com/arcgis \
     --service Demo/Roads.MapServer --service Demo/Zones.MapServer > before.json
 ```
 
+In Windows PowerShell 5.1, `>` writes UTF-16, and the tool refuses that file and says why. In that
+shell, pipe the output instead: `| Set-Content -Encoding ascii before.json`. Use a new file name
+for each snapshot, because the shell empties an existing file before the tool runs.
+
 Overwrite the services. Then compare. Nothing is written.
 
 ```
@@ -108,6 +123,7 @@ Demo/Roads.MapServer: 8 differences from the snapshot
   properties.maxRecordCount                      live 1000, saved 4000
   properties.schemaLockingEnabled                live true, saved false
   provider                                       live DMaps, saved ArcObjects11
+Demo/Zones.MapServer: matches the snapshot
 VERDICT: DIFFERS
 ```
 
@@ -122,6 +138,7 @@ python svcparity.py --restore --state before.json --server https://gis.example.c
 ```
 Demo/Roads.MapServer: 8 differences from the snapshot
   ...
+Demo/Zones.MapServer: matches the snapshot
 backup written: undo.json
 Demo/Roads.MapServer: restored and read back
 VERDICT: MATCH
@@ -148,16 +165,16 @@ Credentials come from the environment and never from a flag.
 |---|---|
 | `SVCPARITY_TOKEN` | A token you already hold. |
 | `SVCPARITY_USER`, `SVCPARITY_PASSWORD` | Mint a token from the server's `generateToken`. |
-| `SVCPARITY_PORTAL_TOKEN` | The portal token for `--portal`. It defaults to `SVCPARITY_TOKEN`. |
+| `SVCPARITY_PORTAL_TOKEN` | The portal token for `--portal`. It defaults to the server token, which is `SVCPARITY_TOKEN` or the token minted from the user and password. The self-test pins the `SVCPARITY_TOKEN` default. |
 
 On a federated site, Esri says the Administrator Directory takes one of two things
 ([Accessing the Administrator Directory on a federated server](https://enterprise.arcgis.com/en/portal/11.2/administer/linux/accessing-the-administrator-directory-on-a-federated-server.htm)).
 One is "a portal token generated for a portal administrator or publisher". The other is "the
 primary site administrator name and password". Unless you use the primary site administrator, get a portal token yourself and pass it in
-`SVCPARITY_TOKEN`. The `generateToken` call that `SVCPARITY_USER` triggers uses
-`client=requestip`, one of the values in Esri's
-[Generate Token](https://developers.arcgis.com/rest/services-reference/enterprise/generate-token.htm)
-reference.
+`SVCPARITY_TOKEN`. The tool posts the `generateToken` call that `SVCPARITY_USER` triggers to the
+Administrator API. It sends `client=requestip` and an expiration of 15 minutes. Esri's
+[Generate Token](https://developers.arcgis.com/rest/enterprise-administration/server/generatetoken/)
+page lists `referer | ip | requestip` for `client` and gives `expiration` in minutes.
 
 Exit codes:
 
@@ -181,11 +198,16 @@ Exit codes:
 | Service properties | `maxRecordCount`, `maxBufferCount`, `maxImageHeight`, `maxImageWidth`, `maxDomainCodeCount`, `antialiasingMode`, `textAntialiasingMode`, `schemaLockingEnabled` |
 | Each extension | `enabled`, `capabilities` and its `properties` |
 
-The lists are the `CONFIGURATION` block at the top of the file. The pool keys and the `extensions`
-layout are the ones on Esri's Edit Service page. Esri's
+The lists are the `CONFIGURATION` block at the top of the file. Esri's
+[Edit Service](https://developers.arcgis.com/rest/enterprise-administration/server/editservice/)
+page names every pool key in the table, and it names `typeName`, `capabilities`, `enabled` and
+`properties` for an extension. Esri's
 [Setting map service properties](https://enterprise.arcgis.com/en/server/10.7/publish-services/linux/setting-map-service-properties.htm)
-page describes the map service settings. It does not list the JSON key names, so I took those from
-service JSON that I have read.
+page names `maxImageHeight`, `maxImageWidth`, `maxDomainCodeCount` and `schemaLockingEnabled`.
+It describes the record limit and the antialiasing settings in words and gives no key name for
+them. I took `maxRecordCount`, `maxBufferCount`, `antialiasingMode`, `textAntialiasingMode` and the
+top-level `provider` key from service JSON that I have read. I found no Esri page that shows
+`provider` in the service JSON.
 
 The tool does not save the rest of the service JSON, and this is on purpose. The `properties`
 object also holds the path of the service definition that the overwrite just installed. Posting
@@ -216,6 +238,10 @@ that links the two, so you name each item with `--item`.
   password. The self-test pins that a restore plan sends no POST.
 - **The parser refuses a prefix of `--apply`.** The parser sets `allow_abbrev=False`. The
   self-test pins that `--ap` and `--appl` exit 64 and write nothing.
+- **A snapshot may name only the keys the tool saves.** The tool checks the pool and properties
+  groups of a snapshot file against the allowlist when it reads the file. A hand-edited key such
+  as `pool.serviceName` or `properties.filePath` is refused with exit 64, because the edit call
+  would send it to the server.
 - **`--apply` needs `--backup`.** The tool writes the pre-restore state to a file that must not
   exist, before its first write. It makes no file when no service needs a change.
 - **A failed restore puts the service back.** After each restore the tool waits until the service
@@ -233,14 +259,17 @@ that links the two, so you name each item with `--item`.
 - **Plain `http://` is accepted for `127.0.0.1` and `localhost` only.** Any other server needs `https://`. There
   is no flag to turn certificate checks off.
 - **A bad URL is a usage error.** The tool trims whitespace around `--server` and `--portal`. It
-  refuses a space or control character inside, a malformed host or port, and a user name or
-  password in the URL, with exit 64. Service names and item ids must match exactly, with no
-  trailing newline.
+  refuses a space or control character inside, a malformed host or port, a query string or
+  fragment, and a user name or password in the URL, with exit 64. Service names and item ids must
+  match exactly, with no trailing newline.
+- **A redirect is an error.** The tool does not follow a 3xx reply. A redirect would send the
+  token to the host in the `Location` header, and it could step down from https to http.
 - **The token moves the way Esri says.** A GET carries the token in the query. A POST carries it
   in the body, as the Administrator API pages require. The password goes in a POST body only.
-- **Every credential is masked in the output.** The tool replaces any token or password it has
-  seen with `***`. That includes one that a server echoes back in an error message, and the
-  traceback that the tool prints on exit 70.
+- **Every credential is masked in the output, in the form it was given.** The tool replaces any
+  token or password it has seen with `***`. That includes one that a server echoes back in an
+  error message, and the traceback that the tool prints on exit 70. A server that echoes it
+  percent-encoded is not masked (see Limits).
 
 ## Why the obvious version is wrong
 
@@ -277,10 +306,20 @@ Every row ran against the local stub, through `main()`, with the output checked.
 | A snapshot that compares nothing exits 4 | `compares nothing and exits 4` |
 | Edit capabilities need `--allow-edit-capabilities` | The two `edit capabilities` assertions |
 | A rejected edit, a refused provider, a missing read-back and a service that never returns all end in a revert or a clear failure | The `attempt` assertions |
+| A redirect is not followed, so the token stays with the host you named | `a redirect is an error`: a second stub records every request it gets |
+| A snapshot with a UTF-8 byte order mark loads, and a UTF-16 one is refused with its cause | The byte order mark and UTF-16 assertions. I also ran Windows PowerShell 5.1 by hand: `>` gave a UTF-16 file that the tool refused, and `\| Set-Content -Encoding ascii` gave a file that matched |
+| A hand-edited snapshot may not name a key outside the allowlist | The `a pool key the tool does not own` and `a property key the tool does not own` assertions |
+| A missing `provider` is flagged, not skipped silently | The `no provider` assertions on `--snapshot` and `--diff` |
+| Most code-behaviour statements in Limits | An assertion whose label ends in `(a known limit)`. A fix for one of them fails the self-test, so the README has to change with it. Not pinned: the 60 second timeout (the test uses a shorter one), a stale read that lasts longer than one poll, and the port exhaustion on a busy host |
+| `--backup NUL` discards the backup on Windows | By hand on Windows: the tool printed `backup written: NUL` and no file appeared |
 | No credential reaches any output | The last assertion greps everything every run printed, and the one backup file it read |
 | A real subprocess run, with the stub on loopback, matches the sample output above | I ran `--snapshot`, `--diff`, `--restore` and `--restore --apply --backup` as separate processes and kept the output |
 
 ## Limits
+
+These are the limits I know. Each one is a fact about the current code.
+
+**What I could not run**
 
 - **No real ArcGIS Server.** I could not reach an ArcGIS Server from the machine that built this.
   The stub follows the Esri pages linked above. Those pages show only the success reply of Edit
@@ -288,24 +327,55 @@ Every row ran against the local stub, through `main()`, with the output checked.
   with an `error` object, or with `status` set to `error`, as a failure, and the stub uses the same
   shapes. I have not seen them from a live server in this build. Run `--diff` and a plan on a test
   service first.
-- **Tokens in the query string.** A GET carries its token in the query, so a proxy or an access
-  log can see it. Esri
-  [recommends](https://enterprise.arcgis.com/en/server/11.5/administer/linux/accessing-arcgis-token-secured-web-services.htm)
-  the `X-Esri-Authorization` header for GET requests to token-secured services. I found no
-  statement that the Administrator API accepts it, so I did not use it. Ask for a short token.
+- **No restfake fault is exercised.** [restfake](https://github.com/uhsear/restfake) has no
+  Administrator API, so this tool does not use it. The tool runs against its own stub, which
+  can return an error, an empty reply, a cut reply, a slow reply, a redirect and a service that
+  does not come back.
 - **Service types.** Change Provider does not support SDS, geocode or geoprocessing services
   ([Change Provider](https://developers.arcgis.com/rest/enterprise-administration/server/change-provider/)).
   The server's error is reported and the service is put back.
-- **A missing extension is not created.** The live service may lack a saved extension. The tool
-  reports it as not restorable and exits 1.
-- **No cross-site mode.** The tool compares a service with its own earlier snapshot. This version
-  does not compare one site with another.
-- **Downtime.** Each restore restarts the service.
 - **TLS.** The tool fails on a certificate that your machine does not trust. Fix the trust store.
-- **Coverage.** Branch coverage on Windows with Python 3.13 is 100 percent (1013 of 1013 statements, 266 of 266 branches). No line is excluded
+- **Coverage.** Branch coverage on Windows with Python 3.13 is 100 percent (1280 of 1280 statements, 318 of 318 branches). No line is excluded
   and no line is unreachable offline. I did not install `coverage` on the Linux host, so I did not
   measure coverage there. Both hosts run the same assertions.
-- **Self-test counts.** The self-test prints 125 assertions on each of three runs: Windows with Python 3.13, Windows with Python 3.9 and Linux with Python 3.12. The Windows and Linux outputs are byte-identical, so no difference needs explaining.
+- **Self-test counts.** The self-test prints 214 assertions on each of four runs: Windows with Python 3.13, 3.12 and 3.9, and Linux with Python 3.12. The Windows and Linux outputs are byte-identical, so no difference needs explaining.
+- **Busy hosts.** The self-test opens several hundred loopback connections. On a Windows host with its ephemeral ports used up (WinError 10048), reviewers saw many FAIL lines and exit 70 instead of a clean failure. The same test passed once the ports were free, so run it again.
+
+**What it does not compare**
+
+- **Only saved settings are compared.** An extension that the overwrite adds, a pool key that the snapshot lacks, and an extension property that the tool withholds are never reported.
+- **Provider.** The tool reads a top-level `provider` key. If the service JSON has none, `--snapshot` warns on standard error and `--diff` prints a note, and the pool kind is not compared. The verdict can still be `MATCH`.
+- **A snapshot entry with no settings.** Next to a normal entry, it prints "matches the snapshot" and exits 0 for that service. Only a snapshot with nothing in it exits 4. The tool cannot produce such an entry from a real service.
+- **Numbers compare as text.** A saved `900.0` differs from a live `900`. A server does not normally return a float there.
+- **Withheld names.** The withhold list matches part of a name. `security` (it holds `uri`) and `bypass` (it holds `pass`) are dropped, and drift there reads as a match. The tool names withheld properties when it takes the snapshot, and `--diff` never mentions them.
+- **Edit capabilities.** The guard reads the `capabilities` string of an extension only. A restore can switch on editing through a property such as `syncEnabled` or `allowGeometryUpdates` without `--allow-edit-capabilities`.
+- **A missing extension is not created.** The live service may lack a saved extension. The tool reports it as not restorable and exits 1. The other settings of that service are still restored, and the output still says "restored and read back" for the service.
+- **No cross-site mode.** The tool compares a service with its own earlier snapshot. This version does not compare one site with another.
+
+**Credentials**
+
+- **Names, not values.** The credential filter reads key names only. It misses names such as `accessKey` and `authorization`, it matches harmless names such as `credits`, and it cannot see a secret inside a value, such as a connection string. The tool saves such a value as it is, and the edit call sends it back to the same server. WMS-style contact details are saved too.
+- **Masking.** The mask matches the secret in the form it was given. A server that echoes a token percent-encoded (a token with `/`, `+` or `=`) shows it unmasked. A short token or password is masked wherever it appears, so a printed snapshot can hold `***` where a real value stood, and a restore from that file would write `***`.
+- **No trimming.** The tool uses `SVCPARITY_TOKEN` and `SVCPARITY_PASSWORD` as given. A trailing space, such as `set X=abc && ...` in cmd.exe, is sent, and the mask then matches only the value with the space.
+- **The portal token.** If `SVCPARITY_PORTAL_TOKEN` is not set, the server token goes to the host named by `--portal`. That includes a token minted from `SVCPARITY_USER`.
+- **Tokens in the query string.** A GET carries its token in the query, so a proxy or an access log can see it. Esri
+  [recommends](https://enterprise.arcgis.com/en/server/11.5/administer/linux/accessing-arcgis-token-secured-web-services.htm)
+  the `X-Esri-Authorization` header for GET requests to token-secured services. I found no
+  statement that the Administrator API accepts it, so I did not use it. Ask for a short token.
+
+**Files and the shell**
+
+- **Shell redirects.** `> before.json` empties an existing file before the tool runs, so a failed snapshot (exit 3) leaves an empty file. In Windows PowerShell 5.1 the redirect writes UTF-16, and the tool refuses that file (see Usage).
+- **Backup files.** On Windows the backup has CRLF line ends, because the tool opens it in text mode. `--backup NUL` passes the "must not exist" check and discards the backup.
+
+**Timing and faults**
+
+- **Request timeout.** Each request has a 60 second timeout. A service that needs longer to restart during Edit Service is reported as `FAILED` and put back, even if the edit worked.
+- **The wait for the service.** A stale status read that lasts longer than one poll still passes. A server that omits both `configuredState` and `realTimeState` also passes, because two missing values are equal.
+- **Put back as found.** The revert skips a saved provider that is not `ArcObjects11` or `DMaps`, such as a legacy `ArcObjects`. After a failed restore that already ran `changeProvider`, the provider can stay changed while the output says "Put back as found".
+- **Interrupts.** Ctrl-C during `--apply` gives a traceback, no revert and no "NOT put back" line. The backup file that the tool already wrote is the only record. Deeply nested JSON in a state file or a server reply raises `RecursionError`, and a broken pipe on standard output (`| head`) also exits 70.
+- **IPv6 loopback.** `http://[::1]` is refused. Only `127.0.0.1` and `localhost` may use plain http.
+- **Downtime.** Each restore restarts the service.
 
 ## Contributing
 

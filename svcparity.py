@@ -46,7 +46,8 @@ import time
 import traceback
 from http.client import HTTPException
 from urllib.parse import urlencode, urlsplit
-from urllib.request import ProxyHandler, Request, build_opener
+from urllib.request import (HTTPRedirectHandler, ProxyHandler, Request,
+                            build_opener)
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -359,6 +360,11 @@ def valid_state(st):
     for group in ("pool", "properties", "extensions"):
         if not isinstance(st.get(group, {}), dict):
             return False
+    # The edit call sends these keys back, so a hand-edited snapshot may not
+    # name one that this tool does not own, such as the definition path.
+    if not (set(st.get("pool", {})) <= set(POOL_KEYS)
+            and set(st.get("properties", {})) <= set(PROP_KEYS)):
+        return False
     for ext in st.get("extensions", {}).values():
         if not isinstance(ext, dict) or not isinstance(ext.get("properties", {}), dict):
             return False
@@ -388,9 +394,17 @@ def check_state_doc(doc, where):
 
 
 def load_state(path):
+    """Read a snapshot. A UTF-8 byte order mark is accepted, because Notepad and
+    PowerShell write one. UTF-16, which a Windows PowerShell 5.1 '>' writes, is
+    refused with its own message."""
     try:
-        with io.open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
+        with io.open(path, "rb") as fh:
+            raw = fh.read()
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            raise UsageError("%s is UTF-16, which a Windows PowerShell 5.1 '>' "
+                             "writes. Save the snapshot as UTF-8 or ASCII."
+                             % path)
+        doc = json.loads(raw.decode("utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise UsageError("cannot read %s: %s" % (path, exc))
     return check_state_doc(doc, path)
@@ -402,8 +416,8 @@ def check_url(url):
     """Plain http is accepted for loopback only, so the first request never
     crosses a network in clear text. Surrounding whitespace is dropped, because
     a file read in PowerShell keeps its newline. Any other whitespace or control
-    character, and any user name or password in the URL, is refused before the
-    URL can reach a request or a message."""
+    character, a query string or fragment, and any user name or password in the
+    URL, is refused before the URL can reach a request or a message."""
     url = url.strip()
     if re.search(r"[\s\x00-\x1f\x7f]", url):
         raise UsageError("the URL contains a space or a control character")
@@ -412,6 +426,9 @@ def check_url(url):
         parts.port      # raises ValueError for a port that is not a number
     except ValueError:
         raise UsageError("the URL is malformed")
+    if "?" in url or "#" in url:
+        raise UsageError("the URL must be a plain address with no ? or #; "
+                         "credentials come from the environment")
     if "@" in parts.netloc:
         raise UsageError("the URL must not carry a user name or password; "
                          "credentials come from the environment")
@@ -423,11 +440,19 @@ def check_url(url):
     return url.rstrip("/")
 
 
+class NoRedirect(HTTPRedirectHandler):
+    """A redirect would carry the token to wherever the Location header points,
+    and could drop from https to http on the way. The 3xx is an error instead."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
 def opener_for(url):
     """Never send loopback traffic through a proxy."""
     if urlsplit(url).hostname in LOOPBACK:
-        return build_opener(ProxyHandler({}))
-    return build_opener()
+        return build_opener(NoRedirect, ProxyHandler({}))
+    return build_opener(NoRedirect)
 
 
 def reply_message(doc):
@@ -605,6 +630,10 @@ def read_items(client, ids):
     return out
 
 
+NO_PROVIDER = ("%s: no provider is saved, so dedicated or shared instances "
+               "cannot be compared")
+
+
 def cmd_snapshot(args, client):
     services, withheld = {}, {}
     for svc in args.service:
@@ -620,7 +649,16 @@ def cmd_snapshot(args, client):
     for svc, names in sorted(withheld.items()):
         say("svcparity: %s: left out of the snapshot: %s"
             % (svc, ", ".join(names)), err=True)
+    for svc in no_provider(doc):
+        say("svcparity: " + NO_PROVIDER % svc, err=True)
     return EXIT_OK
+
+
+def no_provider(state):
+    """Services whose saved state holds no provider. The service JSON may not
+    carry that key, and then nothing can say if a pool was switched."""
+    return [svc for svc, st in sorted(state["services"].items())
+            if st.get("provider") is None]
 
 
 def survey(state, client):
@@ -634,10 +672,12 @@ def survey(state, client):
     return rows
 
 
-def report(rows, sharing):
+def report(rows, sharing, missing):
     for row in rows:
         for line in render(row):
             say(line)
+    for svc in missing:
+        say("note: " + NO_PROVIDER % svc)
     for line in sharing:
         say("sharing (read-only, never restored): " + line)
 
@@ -646,7 +686,7 @@ def cmd_diff_restore(args, client, state, restore):
     rows = survey(state, client)
     live_items = read_items(client, sorted(state["items"]))
     sharing = diff_sharing(state["items"], live_items)
-    report(rows, sharing)
+    report(rows, sharing, no_provider(state))
     unreadable = any(r.error for r in rows) or None in live_items.values()
     compared = sum(len(flatten(state["services"][r.svc]))
                    for r in rows if not r.error) + len(state["items"])
@@ -920,7 +960,7 @@ def make_stub():
     import threading
     from http.server import BaseHTTPRequestHandler, HTTPServer
     from socketserver import ThreadingMixIn
-    from urllib.parse import parse_qsl
+    from urllib.parse import parse_qsl, quote
 
     class Stub(object):
         token, ptoken = "tkn-synthetic-0001", "ptkn-synthetic-0002"
@@ -929,6 +969,7 @@ def make_stub():
         def __init__(self):
             self.services, self.running, self.items = {}, {}, {}
             self.fault, self.log, self.mint = {}, [], {}
+            self.redirect_to = None
 
     stub = Stub()
 
@@ -1034,6 +1075,9 @@ def make_stub():
             kind = fault.get("get")
             if kind == "echo":
                 return self.reply(error("rejected, token %s" % sent["token"]))
+            if kind == "echoenc":
+                return self.reply(error("rejected, token %s"
+                                        % quote(sent["token"], safe="")))
             if kind == "cut":
                 return self.reply(None, raw=b'{"serviceName": "x"}', cut=True)
             if kind == "http500":
@@ -1042,6 +1086,11 @@ def make_stub():
                 return self.reply(None, raw=b"<html>not json</html>")
             if kind == "list":
                 return self.reply(None, raw=b"[]")
+            if kind == "redirect":
+                self.send_response(302)
+                self.send_header("Location", stub.redirect_to + self.path)
+                self.end_headers()
+                return
             if kind == "slow":
                 import time as real_time
                 real_time.sleep(1.2)
@@ -1190,6 +1239,15 @@ def _self_test(stub, tmp, clock):
           "a reordered or re-cased capability list is not a difference")
     check(not same(("pool", "x"), None, "1") and same(("pool", "x"), 1, "1"),
           "an absent live value differs, and 1 equals '1'")
+    check(not any(same(("pool", "x"), None, w) for w in (0, "", False, [])),
+          "an absent live value differs even when the saved value is 0, empty "
+          "or false  <-- pinned defect")
+    check(same(("pool", "x"), 900, "900") and not same(("pool", "x"), 900, 900.0),
+          "numbers compare as text, so a saved 900.0 differs from a live 900")
+    check(caps_key("Query,,") == frozenset(["query"])
+          and caps_key(" , ") == frozenset(),
+          "an empty capability token is dropped, so a stray comma is not a "
+          "difference  <-- pinned defect")
     check(same(("ext", "F", "capabilities"), "Query,Create", "Create,Query")
           and not same(("ext", "F", "properties", "capabilities"), "a,b", "b,a"),
           "capabilities compare as a set only on the extension field, not on "
@@ -1229,6 +1287,39 @@ def _self_test(stub, tmp, clock):
           and "outputDir" not in json.dumps(secret_state),
           "a credential-like or path-like extension property never enters the "
           "state, and is reported by name")
+    secret_names = ["dbPassword", "dbPwd", "clientSecret", "credentialId",
+                    "authToken", "apiKey", "api_key"]
+    place_names = ["outputDir", "tempPath", "workFolder", "serviceUrl",
+                   "baseUri"]
+    probe_ext = {"extensions": [{"typeName": "E", "properties": dict(
+        (n, "v") for n in secret_names + place_names
+        + ["maxRecordCount", "contactEmail"])}]}
+    kept = extract_state(probe_ext)
+    check(sorted(kept[1]) == sorted("ext.E.properties." + n for n in
+                                    secret_names + place_names)
+          and sorted(kept[0]["extensions"]["E"]["properties"])
+          == ["contactEmail", "maxRecordCount"],
+          "an extension property is withheld for each word on the list: pass, "
+          "pwd, secret, cred, token, api key, dir, path, folder, url and uri, "
+          "and contact details are kept  <-- pinned defect")
+    check(sorted(extract_state({"extensions": [{"typeName": "E", "properties": {
+        "security": 1, "bypass": 1}}]})[1])
+          == ["ext.E.properties.bypass", "ext.E.properties.security"],
+          "the withhold list matches part of a name, so security and bypass "
+          "are dropped  (a known limit)")
+    check(secret_keys(dict((n, 1) for n in secret_names))
+          == ["/" + n for n in secret_names]
+          and secret_keys(dict((n, 1) for n in place_names)) == []
+          and secret_keys({"accessKey": 1, "authorization": 1, "credits": 1})
+          == ["/credits"],
+          "the credential-key guard names each credential word and leaves a "
+          "location word alone  <-- pinned defect")
+    spoken = io.StringIO()
+    with contextlib.redirect_stdout(spoken):
+        say("caf" + chr(233) + " " + chr(0x4e2d))
+    check(spoken.getvalue() == "caf? ?" + chr(10),
+          "output is ASCII only: a character outside ASCII prints as ?  "
+          "<-- pinned defect")
     check(plan(state, tuned) == [], "a service that matches its state plans nothing")
     changes = plan(state, over)
     paths = [".".join(c.path) for c in changes]
@@ -1284,6 +1375,23 @@ def _self_test(stub, tmp, clock):
                                        "FeatureServer:update"],
           "switching an extension on counts as exposure even when its "
           "capability string did not change  <-- pinned defect")
+    def ext_doc(enabled, caps):
+        return {"extensions": [{"typeName": "F", "enabled": enabled,
+                                "capabilities": caps}]}
+
+    check(edit_exposure(ext_doc("false", "Query"), ext_doc("True", "Query,Create"))
+          == ["F:create"]
+          and edit_exposure(ext_doc(False, "Query"), ext_doc(True, "Delete"))
+          == ["F:delete"]
+          and edit_exposure(ext_doc("false", "Query"), ext_doc("false", "Create"))
+          == [],
+          "an extension that is enabled as True or true counts as exposure, and "
+          "one that stays off does not  <-- pinned defect")
+    sync_on = ext_doc("true", "Query")
+    sync_on["extensions"][0]["properties"] = {"syncEnabled": "true"}
+    check(edit_exposure(ext_doc("true", "Query"), sync_on) == [],
+          "the edit guard reads the capabilities string and not a property "
+          "such as syncEnabled  (a known limit)")
     saved_items = {ITEM1: {"access": "org", "groups": ["g1", "g2"]}}
     check(diff_sharing(saved_items, saved_items) == []
           and diff_sharing(saved_items, {ITEM1: None})
@@ -1318,6 +1426,53 @@ def _self_test(stub, tmp, clock):
           and reply_message({}) == "no message",
           "an error body is read in both shapes the server uses")
 
+    # ---- the wait for a service to settle
+    class Scripted(object):
+        def __init__(self, pattern):
+            self.pattern, self.reads = pattern, 0
+
+        def status(self, svc):
+            self.reads += 1
+            return {"realTimeState": self.pattern(self.reads)}
+
+    settled = Scripted(lambda n: ["UP", "DOWN", "UP", "UP"][min(n, 4) - 1])
+    clock[0] = 1000.0
+    wait_state(settled, SVC1, "UP")
+    check(settled.reads == 4,
+          "a status read that is not the earlier state resets the count, so "
+          "two reads in a row are needed  <-- pinned defect")
+    raises(lambda: wait_state(Scripted(lambda n: "UP" if n % 2 else "DOWN"),
+                              SVC1, "UP"), ServiceError,
+           "a service that flaps between two states never counts as settled"
+           "  <-- pinned defect")
+    blank = Scripted(lambda n: None)
+    wait_state(blank, SVC1, None)
+    check(blank.reads == 2,
+          "two status replies without a state count as settled when none was "
+          "expected  (a known limit)")
+    check(is_service({"serviceName": "X"}) and is_service(
+        {"serviceName": "X", "properties": {}, "extensions": [
+            {"typeName": "F", "properties": {}}]}),
+          "a service description needs only a name")
+    odd_services = [
+        ("a name that is not text", {"serviceName": 5}),
+        ("properties that are a list", {"serviceName": "X", "properties": []}),
+        ("extensions that are an empty string",
+         {"serviceName": "X", "extensions": ""}),
+        ("extensions that are an object", {"serviceName": "X", "extensions": {}}),
+        ("an extension that is not an object",
+         {"serviceName": "X", "extensions": ["F"]}),
+        ("an extension type that is not text",
+         {"serviceName": "X", "extensions": [{"typeName": 5}]}),
+        ("extension properties that are a list",
+         {"serviceName": "X", "extensions": [{"typeName": "F",
+                                               "properties": []}]}),
+    ]
+    for label, doc in odd_services:
+        check(not is_service(doc),
+              "a service description with %s is not accepted  "
+              "<-- pinned defect" % label)
+
     # ---- files and the command line
     good_doc = {"format": FORMAT, "services": {SVC1: state}, "items": {}}
     check(load_state(save("good.json", good_doc))["services"][SVC1] == state,
@@ -1344,6 +1499,27 @@ def _self_test(stub, tmp, clock):
         ("an item id with a trailing newline",
          dict(good_doc, items={ITEM1 + "\n": {"access": "org", "groups": []}})),
         ("a list", []),
+        ("an item id of 33 hex digits",
+         dict(good_doc, items={"a" * 33: {"access": "org", "groups": []}})),
+        ("a service name with a double slash",
+         dict(good_doc, services={"Demo//Roads.MapServer": state})),
+        ("a service name with a leading slash",
+         dict(good_doc, services={"/Roads.MapServer": state})),
+        ("a service name with a space",
+         dict(good_doc, services={"Demo/Ro ads.MapServer": state})),
+        ("a service name without a type",
+         dict(good_doc, services={"Roads": state})),
+        ("a pool key the tool does not own",
+         dict(good_doc, services={SVC1: {"pool": {"serviceName": "X"}}})),
+        ("a property key the tool does not own",
+         dict(good_doc, services={SVC1: {"properties": {"filePath": "/x"}}})),
+        ("services that are a list", dict(good_doc, services=[])),
+        ("items that are a list", dict(good_doc, items=[])),
+        ("an item that is not an object", dict(good_doc, items={ITEM1: []})),
+        ("an item whose access is not text",
+         dict(good_doc, items={ITEM1: {"access": 5, "groups": []}})),
+        ("an item whose groups are not a list",
+         dict(good_doc, items={ITEM1: {"access": "org", "groups": "g1"}})),
     ]
     for label, doc in bad_docs:
         raises(lambda doc=doc: load_state(save("bad.json", doc)), UsageError,
@@ -1354,6 +1530,25 @@ def _self_test(stub, tmp, clock):
            "a file that is not JSON is refused")
     raises(lambda: load_state(tmpfile("absent.json")), UsageError,
            "a file that does not exist is refused")
+    import codecs
+    text = json.dumps(good_doc)
+    with io.open(tmpfile("bom.json"), "wb") as fh:
+        fh.write(codecs.BOM_UTF8 + text.encode("ascii"))
+    check(load_state(tmpfile("bom.json"))["services"][SVC1] == state,
+          "a snapshot saved with a UTF-8 byte order mark loads  "
+          "<-- pinned defect")
+    for label, blob in (("little endian", text.encode("utf-16")),
+                        ("big endian", codecs.BOM_UTF16_BE
+                         + text.encode("utf-16-be"))):
+        with io.open(tmpfile("u16.json"), "wb") as fh:
+            fh.write(blob)
+        code, out, err = cli(["--diff", "--state", tmpfile("u16.json")] + srv,
+                             **tok)
+        check(code == 64 and "is UTF-16" in err
+              and "Save the snapshot as UTF-8" in err,
+              "a UTF-16 snapshot (%s), as a PowerShell 5.1 redirect writes it, "
+              "is refused with a message that names the cause  "
+              "<-- pinned defect" % label)
     check(check_url("https://h.example/arcgis/") == "https://h.example/arcgis"
           and check_url("http://127.0.0.1:6080/arcgis")
           and check_url("http://localhost/arcgis"),
@@ -1363,7 +1558,7 @@ def _self_test(stub, tmp, clock):
           "whitespace around a URL, such as the newline of a file read in "
           "PowerShell, is dropped")
     for url in ("http://gis.example.com/arcgis", "gis.example.com", "ftp://x/y",
-                "https://"):
+                "https://", "http://[::1]:6080/arcgis"):
         raises(lambda url=url: check_url(url), UsageError,
                "%s is refused, so the first request is never sent in clear text"
                % url)
@@ -1375,6 +1570,17 @@ def _self_test(stub, tmp, clock):
         raises(lambda url=url: check_url(url), UsageError,
                "a URL with %s is a usage error, not a fault in the tool  "
                "<-- pinned defect" % label)
+    for label, url in (("a query string", "https://h.example/arcgis?token=abc1"),
+                       ("a bare question mark", "https://h.example/arcgis?"),
+                       ("a fragment", "https://h.example/arcgis#top")):
+        raises(lambda url=url: check_url(url), UsageError,
+               "a URL with %s is refused  <-- pinned defect" % label)
+    code, out, err = cli(["--snapshot", "--server",
+                          "https://h.example/arcgis?token=abc123-synthetic",
+                          "--service", SVC1], SVCPARITY_TOKEN="t")
+    check(code == 64 and "abc123-synthetic" not in out + err,
+          "a token typed into the --server URL is refused and never printed"
+          "  <-- pinned defect")
     with env_patch("https_proxy", https_proxy="http://proxy.invalid:3128"):
         loop_proxies = [h.proxies for h in opener_for("http://127.0.0.1:1/")
                         .handlers if isinstance(h, ProxyHandler)]
@@ -1467,6 +1673,40 @@ def _self_test(stub, tmp, clock):
           and "leak-probe-secret-8" not in err_buf.getvalue(),
           "the traceback printed on exit 70 is masked like every other line  "
           "<-- pinned defect")
+    def main_with_run(fn, argv):
+        real = globals()["run"]
+        globals()["run"] = fn
+        try:
+            return main(argv)
+        finally:
+            globals()["run"] = real
+
+    def interrupt(_args):
+        raise KeyboardInterrupt()
+
+    raises(lambda: main_with_run(interrupt, ["--diff", "--state", "x",
+                                             "--server", "https://h"]),
+           KeyboardInterrupt,
+           "Ctrl-C is not caught, so it gives a traceback and no revert  "
+           "(a known limit)")
+
+    class Pipe(object):
+        def write(self, _text):
+            raise BrokenPipeError()
+
+    del SECRETS[:]
+    broken = io.StringIO()
+    with env_patch("SVCPARITY_", **tok), contextlib.redirect_stdout(Pipe()), \
+            contextlib.redirect_stderr(broken):
+        code = main(["--snapshot"] + srv + ["--service", SVC1])
+    seen.append(broken.getvalue())
+    check(code == 70 and "BrokenPipeError" in broken.getvalue(),
+          "a broken pipe on standard output exits 70  (a known limit)")
+    with io.open(tmpfile("deep.json"), "w") as fh:
+        fh.write("[" * 100000)
+    code, out, err = cli(["--diff", "--state", tmpfile("deep.json")] + srv, **tok)
+    check(code == 70 and "RecursionError" in err,
+          "a state file nested far too deep exits 70  (a known limit)")
     stub.log[:] = []
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1])
     check(code == 64 and "SVCPARITY_TOKEN" in err and not stub.log,
@@ -1488,12 +1728,42 @@ def _self_test(stub, tmp, clock):
     check(code == 0 and doc["items"][ITEM1] == {
         "access": "org", "groups": ["g1", "g2"]},
           "--item records the access level and the groups visible to the token")
+    stub.items[ITEM2] = {"access": "org", "groups": {
+        "admin": [], "member": [], "other": [{"id": "g5"}]}}
+    code, doc, err = snap("--service", SVC1, *(por + ["--item", ITEM2]))
+    del stub.items[ITEM2]
+    check(code == 0 and doc["items"][ITEM2]["groups"] == ["g5"],
+          "a group that the portal lists under other is recorded too  "
+          "<-- pinned defect")
+    stub.ptoken, real_ptoken = stub.token, stub.ptoken
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1] + por
+                         + ["--item", ITEM1], SVCPARITY_TOKEN=stub.token)
+    stub.ptoken = real_ptoken
+    check(code == 0 and ITEM1 in out,
+          "the portal token defaults to SVCPARITY_TOKEN when "
+          "SVCPARITY_PORTAL_TOKEN is not set  <-- pinned defect")
     code, doc, err = snap("--service", SVC3)
     check(code == 0 and "synthetic-db-pass" not in json.dumps(doc)
           and "synthetic-db-pass" not in err
           and doc["withheld"][SVC3] == secret_withheld,
           "a snapshot of a service that holds a credential names the key it "
           "left out and never carries the value")
+    check("no provider is saved" not in err,
+          "a snapshot of a service that carries a provider prints no provider "
+          "warning")
+    held = stub.services[SVC2].pop("provider")
+    code, doc, err = snap("--service", SVC2)
+    check(code == 0 and doc["services"][SVC2]["provider"] is None
+          and "svcparity: Demo/Zones.MapServer: no provider is saved" in err,
+          "a service whose JSON has no provider key is snapshotted with a "
+          "warning on stderr, not silently  <-- pinned defect")
+    noprov = save("noprov.json", doc)
+    code, out, err = cli(["--diff", "--state", noprov] + srv, **tok)
+    stub.services[SVC2]["provider"] = held
+    check(code == 0 and "note: Demo/Zones.MapServer: no provider is saved" in out
+          and "VERDICT: MATCH" in out,
+          "a diff against a snapshot with no provider says that dedicated or "
+          "shared was not compared  <-- pinned defect")
     snap_path = tmpfile("before.json")
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1, "--service",
                                                   SVC2] + por + ["--item", ITEM1],
@@ -1534,7 +1804,17 @@ def _self_test(stub, tmp, clock):
     globals()["HTTP_TIMEOUT"] = 60
     check(code == 3 and "timed out" in err,
           "a server that does not answer is reported, not waited on forever")
+    other = make_stub()
+    stub.redirect_to = other.url
+    stub.fault["get"] = "redirect"
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1], **tok)
+    reached = list(other.log)
+    other.stop()
     stub.fault.clear()
+    check(code == 3 and "HTTP Error 302" in err and not reached
+          and stub.token not in out + err,
+          "a redirect is an error and is not followed, so the token never "
+          "reaches the host that the Location header names  <-- pinned defect")
     code, out, err = cli(["--snapshot"] + srv + ["--service",
                                                  "Demo/Nope.MapServer"], **tok)
     check(code == 3 and "does not exist" in err,
@@ -1611,6 +1891,37 @@ def _self_test(stub, tmp, clock):
     stub.token = real
     check(code == 3, "a non-string token exits 3")
     code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
+                         SVCPARITY_TOKEN=stub.token + " ")
+    check(code == 3 and "Invalid token" in err,
+          "a token with a trailing space is sent as it is and rejected  "
+          "(a known limit)")
+    real = stub.token
+    stub.token = "4000"
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
+                         SVCPARITY_TOKEN="4000")
+    stub.token = real
+    check(code == 0 and json.loads(out)["services"][SVC1]["properties"][
+        "maxRecordCount"] == "***",
+          "a token that equals a saved value masks that value in the printed "
+          "snapshot  (a known limit)")
+    stub.token = "ab/c+d=e"
+    stub.fault["get"] = "echoenc"
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
+                         SVCPARITY_TOKEN="ab/c+d=e")
+    stub.fault.clear()
+    stub.token = real
+    check(code == 3 and "token ab%2Fc%2Bd%3De" in err,
+          "a token that a server echoes percent-encoded is not masked  "
+          "(a known limit)")
+    stub.ptoken, real_ptoken = stub.token, stub.ptoken
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1] + por
+                         + ["--item", ITEM1], SVCPARITY_USER=stub.user,
+                         SVCPARITY_PASSWORD=stub.password)
+    stub.ptoken = real_ptoken
+    check(code == 0 and ITEM1 in out,
+          "a token minted from a user and password also goes to the portal "
+          "when no portal token is set  (a known limit)")
+    code, out, err = cli(["--snapshot"] + srv + ["--service", SVC1],
                          SVCPARITY_TOKEN="expired-token-1")
     check(code == 3 and "Invalid token" in err and "expired-token-1" not in err,
           "an expired token exits 3 and is not printed")
@@ -1620,6 +1931,20 @@ def _self_test(stub, tmp, clock):
     check(code == 0 and "VERDICT: MATCH" in out
           and out.count("matches the snapshot") == 2,
           "--diff of an untouched site matches and exits 0")
+    with io.open(snap_path, "rb") as fh:
+        plain_bytes = fh.read()
+    with io.open(tmpfile("snap-bom.json"), "wb") as fh:
+        fh.write(codecs.BOM_UTF8 + plain_bytes)
+    code, out, err = cli(["--diff", "--state", tmpfile("snap-bom.json")] + srv
+                         + por, **tok)
+    check(code == 0 and "VERDICT: MATCH" in out,
+          "--diff reads a snapshot that starts with a UTF-8 byte order mark")
+    with io.open(tmpfile("snap-u16.json"), "wb") as fh:
+        fh.write(plain_bytes.decode("ascii").encode("utf-16"))
+    code, out, err = cli(["--diff", "--state", tmpfile("snap-u16.json")] + srv
+                         + por, **tok)
+    check(code == 64 and "is UTF-16" in err,
+          "--diff refuses a UTF-16 snapshot with exit 64 and says why")
     overwrite(SVC1)
     stub.log[:] = []
     code, out, err = cli(["--diff", "--state", snap_path] + srv + por, **tok)
@@ -1661,7 +1986,18 @@ def _self_test(stub, tmp, clock):
           "not a clean 0  <-- pinned defect")
     nothing = save("nothing.json", dict(good_doc, services={SVC1: {}}))
     code, out, err = cli(["--diff", "--state", nothing] + srv, **tok)
-    check(code == 4, "a service entry with no settings in it exits 4 too")
+    check(code == 4 and "note: Demo/Roads.MapServer: no provider is saved" in out,
+          "a service entry with no settings in it exits 4 too, and the note "
+          "covers a provider key that is missing, not only null")
+    items_only = save("items-only.json", {
+        "format": FORMAT, "services": {}, "items": {
+            ITEM1: {"access": "org", "groups": ["g1", "g2"]}}})
+    stub.items[ITEM1] = {"access": "org", "groups": {
+        "admin": [{"id": "g1"}], "member": [{"id": "g2"}], "other": []}}
+    code, out, err = cli(["--diff", "--state", items_only] + srv + por, **tok)
+    check(code == 0 and "VERDICT: MATCH" in out,
+          "a snapshot that holds only items counts them as compared  "
+          "<-- pinned defect")
 
     # ---- restore: plan
     stub.log[:] = []
@@ -1740,6 +2076,11 @@ def _self_test(stub, tmp, clock):
     with io.open(backup, encoding="ascii") as fh:
         undo = fh.read()
     seen.append(undo)
+    with io.open(backup, "rb") as fh:
+        crlf = bytes(bytearray([13, 10])) in fh.read()
+    check(crlf == (os.linesep == bytes(bytearray([13, 10])).decode("ascii")),
+          "the backup has the line ends of the host, because it is written in "
+          "text mode  (a known limit)")
     undo_doc = json.loads(undo)
     check(undo_doc["format"] == FORMAT and list(undo_doc["services"]) == [SVC1]
           and undo_doc["services"][SVC1]["provider"] == "DMaps"
@@ -1763,6 +2104,15 @@ def _self_test(stub, tmp, clock):
                           "--backup", gone_backup] + srv + por, **tok)
     check(code == 0 and not posts() and not os.path.exists(gone_backup),
           "a second run finds nothing to do, writes nothing and creates no backup")
+    code, out, err = cli(["--restore", "--state", snap_path] + srv + por, **tok)
+    check(code == 0 and "Plan only" not in out and "VERDICT: MATCH" in out,
+          "a restore plan for a site that already matches prints no plan hint")
+    mixed = save("mixed.json", dict(good_doc, services={SVC1: state, SVC2: {}}))
+    code, out, err = cli(["--diff", "--state", mixed] + srv, **tok)
+    check(code == 0 and out.count("matches the snapshot") == 2
+          and "VERDICT: MATCH" in out,
+          "an entry with no settings, next to a normal one, matches and exits "
+          "0  (a known limit)")
     overwrite(SVC1)
     stub.items[ITEM1]["access"] = "public"
     code, out, err = cli(["--restore", "--state", snap_path, "--apply",
@@ -1779,8 +2129,10 @@ def _self_test(stub, tmp, clock):
     def one_service_state():
         return save("one.json", dict(good_doc, services={SVC1: state}))
 
-    def attempt(label, fault, expect_text, put_back=True, delay=None):
+    def attempt(label, fault, expect_text, put_back=True, provider=None):
         overwrite(SVC1)
+        if provider:
+            stub.services[SVC1]["provider"] = provider
         before = copy.deepcopy(stub.services[SVC1])
         stub.fault.clear()
         stub.fault.update(fault)
@@ -1803,6 +2155,13 @@ def _self_test(stub, tmp, clock):
             "did not read back: properties.maxRecordCount")
     attempt("a provider the server refuses", {"provider": "error"},
             "cannot change provider")
+    err = attempt("a restore from a legacy provider", {"ignore": [
+        "maxRecordCount"]}, "did not read back", put_back=False,
+                  provider="ArcObjects")
+    check("Put back as found" in err
+          and stub.services[SVC1]["provider"] == "ArcObjects11",
+          "a revert skips a legacy provider, so the output says put back while "
+          "the provider stays changed  (a known limit)")
     err = attempt("a service that never comes back", {"never_started": True},
                   "still STOPPED after 120 seconds", put_back=False)
     check("revert failed" in err and "NOT put back: use the backup file" in err,
@@ -1881,7 +2240,8 @@ def _self_test(stub, tmp, clock):
     code, out, err = cli(["--restore", "--state", one_service_state(), "--apply",
                           "--backup", tmpfile("undo-stuck.json")] + srv, **tok)
     check(code == 1 and "NOT RESTORABLE: the live service has no such extension"
-          in out and stub.services[SVC1]["maxInstancesPerNode"] == 6,
+          in out and stub.services[SVC1]["maxInstancesPerNode"] == 6
+          and "Demo/Roads.MapServer: restored and read back" in out,
           "an extension the live service lacks is reported, everything else is "
           "restored, and the exit status says differences remain")
     overwrite(SVC1)
@@ -1894,6 +2254,17 @@ def _self_test(stub, tmp, clock):
           and not os.path.exists(tmpfile("undo-only.json")),
           "a restore with only unrestorable changes writes nothing and "
           "creates no backup")
+
+    overwrite(SVC1)
+    mix_stuck = save("mix-stuck.json", dict(good_doc, services={
+        SVC1: state, SVC2: {"provider": "SDS"}}))
+    code, out, err = cli(["--restore", "--state", mix_stuck, "--apply",
+                          "--backup", tmpfile("undo-mix.json")] + srv, **tok)
+    with io.open(tmpfile("undo-mix.json"), encoding="ascii") as fh:
+        mix_undo = json.load(fh)
+    check(code == 1 and list(mix_undo["services"]) == [SVC1],
+          "the backup names only the services that the restore changes, not "
+          "one whose only difference cannot be restored")
 
     # ---- the harness and the footer
     mark = len(failed)
